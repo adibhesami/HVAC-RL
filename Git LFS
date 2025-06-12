@@ -1,0 +1,1 @@
+git lfs track "*.epw" "*.idf" "*.parquet" "*.zip" "*.xlsm" "*.xlsx" "*.zip" "*.pkl" "*.zip"
