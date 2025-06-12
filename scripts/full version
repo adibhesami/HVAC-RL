@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+evaluate.py
+===========
+
+Comprehensive evaluation script for trained HVAC RL controllers.
+
+Features
+--------
+* SB3 *and* RLlib checkpoint loading.
+* Multiple random seeds, deterministic or stochastic policy.
+* KPI extraction via Gymnasium `info` dict or callback hooks.
+* Pandas  : CSV + Parquet exports.
+* JSON    : aggregated statistics (mean, stdev, CI95, min/max).
+* Matplotlib quick-look plot (optional, headless safe).
+* Coloured logging, progress bar, graceful KeyboardInterrupt.
+
+Author : Your-Name-Here
+Created: 2025-06-12
+License: MIT
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import importlib
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from statistics import mean, stdev
+from typing import Any, Dict, List, Sequence, Tuple
+
+import gymnasium as gym
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+# --------------------------------------------------------------------------- #
+# Optional deps (loaded lazily)                                               #
+# --------------------------------------------------------------------------- #
+try:
+    from stable_baselines3.common.base_class import BaseAlgorithm as _SB3Alg
+    SB3_AVAILABLE = True
+except ImportError:
+    SB3_AVAILABLE = False
+
+try:
+    import ray
+    from ray.rllib.algorithms.algorithm import Algorithm as _RLlibAlg
+    RL_LIB_AVAILABLE = True
+except ImportError:
+    RL_LIB_AVAILABLE = False
+
+
+# --------------------------------------------------------------------------- #
+# Logging helpers                                                             #
+# --------------------------------------------------------------------------- #
+class _LogColour:
+    RESET = "\033[0m"
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+
+
+def _setup_logger(level: str = "INFO") -> None:
+    lev = getattr(logging, level.upper())
+    handler = logging.StreamHandler(sys.stdout)
+    fmt = "%(asctime)s %(levelname)s: %(message)s"
+    handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+    logging.basicConfig(level=lev, handlers=[handler])
+
+
+# --------------------------------------------------------------------------- #
+# Model loading                                                               #
+# --------------------------------------------------------------------------- #
+def _load_sb3(model_path: Path,
+              env: gym.Env,
+              custom_objects: Dict[str, Any] | None = None,
+              deterministic: bool = True):
+    from stable_baselines3.common.base_class import BaseAlgorithm
+
+    logging.info("Loading Stable-Baselines3 model from %s", model_path)
+    model = BaseAlgorithm.load(
+        model_path,
+        env=env,
+        custom_objects=custom_objects or {},
+        print_system_info=False,
+    )
+    return model, lambda obs: model.predict(obs, deterministic=deterministic)[0]
+
+
+def _load_rllib(model_path: Path,
+                env: gym.Env,
+                deterministic: bool = True):
+    logging.info("Loading RLlib algorithm from %s", model_path)
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True, include_dashboard=False)
+    algo = _RLlibAlg.from_checkpoint(str(model_path))
+
+    def _policy(obs):
+        a = algo.compute_single_action(obs, explore=not deterministic)[0]
+        return a
+
+    return algo, _policy
+
+
+def load_model(model_path: Path,
+               env: gym.Env,
+               deterministic: bool = True):
+    """Autodetect SB3 vs RLlib and return (model, policy_fn)."""
+    suffix = model_path.suffix.lower()
+    if suffix == ".zip" and SB3_AVAILABLE:
+        return _load_sb3(model_path, env, deterministic=deterministic)
+    if model_path.is_dir() and RL_LIB_AVAILABLE:
+        # RLlib checkpoints are directories
+        return _load_rllib(model_path, env, deterministic=deterministic)
+    raise ValueError(f"Unsupported model type or missing backend for {model_path}")
+
+
+# --------------------------------------------------------------------------- #
+# KPI extraction helpers                                                      #
+# --------------------------------------------------------------------------- #
+DEFAULT_METRICS = [
+    "episode_reward",
+    "eui",
+    "avg_pmv",
+    "avg_ppd",
+    "comfort_violation_hours",
+    "energy_kwh",
+    "ramping_score",
+    "max_power_kw",
+]
+
+
+def extract_episode_metrics(info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Expected structure:
+    info = {
+        'episode_metrics': {
+            'eui': 230.7,
+            'avg_pmv': 0.32,
+            ...
+        }
+    }
+    Fallback: if episode_metrics missing, derive from raw reward.
+    """
+    if "episode_metrics" in info:
+        return info["episode_metrics"]
+    # fallback – at least return cumulative reward
+    return {"episode_reward": info.get("episode_reward", np.nan)}
+
+
+def _aggregate(episodes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    stats: Dict[str, Any] = {}
+    for k in episodes[0].keys():
+        vals = [ep[k] for ep in episodes if k in ep]
+        if not vals:
+            continue
+        stats[k] = {
+            "mean": mean(vals),
+            "stdev": stdev(vals) if len(vals) > 1 else 0.0,
+            "min": min(vals),
+            "max": max(vals),
+        }
+        # 95 % CI
+        if len(vals) > 1:
+            ci = 1.96 * stats[k]["stdev"] / len(vals) ** 0.5
+            stats[k]["ci95"] = ci
+    return stats
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation loop                                                             #
+# --------------------------------------------------------------------------- #
+def evaluate(
+    model_path: Path,
+    env_id: str,
+    idf_file: Path | None,
+    weather_file: Path | None,
+    episodes: int,
+    seeds: Sequence[int],
+    deterministic: bool,
+    record_traces: bool,
+) -> Tuple[pd.DataFrame, Dict[str, Any], pd.DataFrame | None]:
+    """
+    Returns
+    -------
+    df_episodes : row per episode
+    summary     : aggregated stats dict
+    df_traces   : step-level traces or None
+    """
+    # Build env once; re-seed per episode
+    env: gym.Env = gym.make(
+        env_id,
+        idf_path=str(idf_file) if idf_file else None,
+        weather_path=str(weather_file) if weather_file else None,
+        deterministic_weather=True,
+    )
+
+    model, policy_fn = load_model(model_path, env, deterministic)
+
+    episodic_records: List[Dict[str, Any]] = []
+    trace_records: List[Dict[str, Any]] = []
+
+    total = episodes * len(seeds)
+    pbar = tqdm(total=total, desc="Evaluating episodes")
+
+    try:
+        for seed in seeds:
+            env.reset(seed=seed)
+            for ep in range(episodes):
+                obs, _ = env.reset()
+                done = False
+                ep_reward = 0.0
+                step_idx = 0
+                ep_info: Dict[str, Any] | None = None
+
+                while not done:
+                    action = policy_fn(obs)
+                    obs, reward, done, truncated, info = env.step(action)
+                    ep_reward += reward
+                    # record trace if requested
+                    if record_traces:
+                        trace_records.append(
+                            {
+                                "seed": seed,
+                                "episode": ep,
+                                "step": step_idx,
+                                "reward": float(reward),
+                                **{k: v for k, v in info.items() if isinstance(v, (int, float))},
+                            }
+                        )
+                    step_idx += 1
+                    ep_info = info  # last info is end-of-episode
+
+                metrics = extract_episode_metrics(ep_info or {})
+                metrics["episode_reward"] = ep_reward
+                metrics["seed"] = seed
+                metrics["episode"] = ep
+                episodic_records.append(metrics)
+                pbar.update(1)
+
+    except KeyboardInterrupt:
+        logging.warning("%sInterrupted by user, saving what we have…%s",
+                        _LogColour.YELLOW, _LogColour.RESET)
+    finally:
+        pbar.close()
+        env.close()
+        if RL_LIB_AVAILABLE and isinstance(model, _RLlibAlg):
+            model.stop()
+        elif SB3_AVAILABLE and isinstance(model, _SB3Alg):
+            pass  # SB3 has no close()
+
+    df_episodes = pd.DataFrame(episodic_records)
+    summary = _aggregate(episodic_records)
+    df_traces = pd.DataFrame(trace_records) if record_traces else None
+    return df_episodes, summary, df_traces
+
+
+# --------------------------------------------------------------------------- #
+# CLI & main                                                                  #
+# --------------------------------------------------------------------------- #
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Evaluate a trained RL HVAC controller "
+                    "and compute comfort/energy KPIs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--model", type=Path, required=True,
+                   help="Path to SB3 .zip file or RLlib checkpoint directory.")
+    p.add_argument("--env", default="CustomBuildingEnv-v0",
+                   help="Gymnasium environment ID.")
+    p.add_argument("--idf", type=Path, default=None,
+                   help="Building IDF file (passed to env).")
+    p.add_argument("--weather", type=Path, default=None,
+                   help=".epw weather file (passed to env).")
+    p.add_argument("--episodes", type=int, default=30,
+                   help="Episodes per seed.")
+    p.add_argument("--seeds", type=int, nargs="+", default=[0],
+                   help="One or more RNG seeds.")
+    p.add_argument("--stochastic", action="store_true",
+                   help="Use stochastic actions (explore=True).")
+    p.add_argument("--traces", action="store_true",
+                   help="Save step-by-step traces (can be large).")
+    p.add_argument("--out", type=Path, default=Path("eval_outputs"),
+                   help="Directory for CSV/JSON outputs.")
+    p.add_argument("--log-level", default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    _setup_logger(args.log_level)
+
+    time_tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir: Path = args.out / f"eval_{time_tag}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    logging.info("%sStarting evaluation%s", _LogColour.CYAN, _LogColour.RESET)
+    df_ep, summary, df_trace = evaluate(
+        model_path=args.model,
+        env_id=args.env,
+        idf_file=args.idf,
+        weather_file=args.weather,
+        episodes=args.episodes,
+        seeds=args.seeds,
+        deterministic=not args.stochastic,
+        record_traces=args.traces,
+    )
+
+    # Save artefacts
+    ep_csv = out_dir / "episodes.csv"
+    df_ep.to_csv(ep_csv, index=False)
+    logging.info("Episode metrics → %s", ep_csv)
+
+    smry_json = out_dir / "summary.json"
+    with open(smry_json, "w") as fp:
+        json.dump(summary, fp, indent=2)
+    logging.info("Aggregated summary → %s", smry_json)
+
+    if df_trace is not None:
+        trace_parq = out_dir / "curves.parquet"
+        df_trace.to_parquet(trace_parq, index=False)
+        logging.info("Step traces   → %s", trace_parq)
+
+    logging.info("%sDone!%s", _LogColour.GREEN, _LogColour.RESET)
+
+
+if __name__ == "__main__":
+    main()
