@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+import argparse, gymnasium as gym, pandas as pd
+from stable_baselines3 import PPO
+from pathlib import Path
+
+def run(model_path, env_id, episodes=30):
+    env = gym.make(env_id, deterministic=True)
+    model = PPO.load(model_path, env=env)
+    res = []
+    for ep in range(episodes):
+        obs, _ = env.reset()
+        done, rew_tot = False, 0
+        while not done:
+            act, _ = model.predict(obs, deterministic=True)
+            obs, rew, done, _, info = env.step(act)
+            rew_tot += rew
+        res.append(info["episode_metrics"])
+    pd.DataFrame(res).to_csv("kpi_eval.csv", index=False)
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", default="models/final_model.zip")
+    p.add_argument("--env", default="CustomBuildingEnv-v0")
+    run(**vars(p.parse_args()))
