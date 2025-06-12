@@ -1,0 +1,19 @@
+name: hvac_rl
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - tqdm
+  - pyyaml
+  - gymnasium
+  - stable-baselines3
+  - tensorboard
+  - jupyterlab
+  - pip:
+      - ray[rllib]        # optional, large
+      - energyplus-api    # if you wrap EP launches
