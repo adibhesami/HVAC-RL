@@ -1,2 +1,7 @@
 # HVAC-RL
-Optimizing HVAC Energy Efficiency in Low-Energy Buildings: A Comparative Analysis of Reinforcement Learning Control Strategies under Climate Conditions
+git init           # turns current folder into a repo
+git branch -M main # use 'main' instead of 'master'
+
+# add the remote URL that GitHub gave you:
+git remote add origin https://github.com/adibhesami/hvac-rl-supplement.git
+
