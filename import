@@ -1,0 +1,2 @@
+git add .gitattributes
+git commit -m "chore: track large artefacts with Git LFS"
