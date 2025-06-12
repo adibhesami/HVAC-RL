@@ -1,0 +1,27 @@
+# --- General -------------------------------------------------
+algo: ppo
+total_timesteps: 5000000
+num_envs: 4
+seed: 123
+log_interval: 10000
+eval_every: 50000
+eval_episodes: 10
+early_stop_patience: 10
+
+# --- Environment paths --------------------------------------
+env_id: CustomBuildingEnv-v0
+idf_file: data/building/prototype.idf
+weather_file: data/weather/weather_tehran_2000-2020.epw
+reward_weights:
+  energy: 1.0
+  comfort: 5.0
+  ramping: 10.0
+
+# --- PPO hyper-params ---------------------------------------
+n_steps: 2048
+batch_size: 256
+learning_rate: linear_3e-4_3e-5
+gamma: 0.99
+ent_coef: 0.0
+policy_kwargs:
+  net_arch: [128, 128, 128]
